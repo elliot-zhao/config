@@ -13,7 +13,7 @@ hostname = %APPEND% net-lsp-x.com
 网络信息请求 = type=http-request,pattern=^https?:\/\/net-lsp-x\.com,script-path=https://raw.githubusercontent.com/xream/scripts/main/surge/modules/network-info/net-lsp-x.js,timeout=120
 
 # Panel
-网络信息面板 = type=generic,timeout=120,script-path=https://raw.githubusercontent.com/xream/scripts/main/surge/modules/network-info/net-lsp-x.js,argument="icon=globe&icon-color=#6699FF&LAN=0&SSID=1&IPv6=1&MASK={{{MASK}}}&DOMESTIC_IPv4=bilibili&DOMESTIC_IPv6={{{DOMESTIC_IPv6}}}&LANDING_IPv4={{{LANDING_IPv4}}}&LANDING_IPv6={{{LANDING_IPv6}}}&PRIVACY={{{PRIVACY}}}&FLAG=1&ENTRANCE_DELAY={{{ENTRANCE_DELAY}}}&TIMEOUT={{{TIMEOUT}}}&EVENT_DELAY={{{EVENT_DELAY}}}&RETRIES={{{RETRIES}}}&RETRY_DELAY={{{RETRY_DELAY}}}&ASN={{{ASN}}}&ORG={{{ORG}}}&DOMESTIC_IPv4_KEY={{{DOMESTIC_IPv4_KEY}}}"
+网络信息面板 = type=generic,timeout=120,script-path=https://raw.githubusercontent.com/xream/scripts/main/surge/modules/network-info/net-lsp-x.js,argument="icon=globe&icon-color=#6699FF&LAN=0&SSID=1&IPv6=1&MASK=1&DOMESTIC_IPv4=bilibili&DOMESTIC_IPv6=ddnspod&LANDING_IPv4={{{LANDING_IPv4}}}&LANDING_IPv6={{{LANDING_IPv6}}}&PRIVACY={{{PRIVACY}}}&FLAG=1&ENTRANCE_DELAY={{{ENTRANCE_DELAY}}}&TIMEOUT={{{TIMEOUT}}}&EVENT_DELAY={{{EVENT_DELAY}}}&RETRIES={{{RETRIES}}}&RETRY_DELAY={{{RETRY_DELAY}}}&ASN=1&ORG={{{ORG}}}&DOMESTIC_IPv4_KEY={{{DOMESTIC_IPv4_KEY}}}"
 
 [Panel]
 {{{PANEL_NAME}}} = script-name=网络信息面板,update-interval={{{UPDATE-INTERVAL}}}
