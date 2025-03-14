@@ -18,6 +18,9 @@ DOMAIN-SUFFIX,grammarly.com
 DOMAIN-SUFFIX,zotero.org
 DOMAIN-KEYWORD,clarivate
 DOMAIN-SUFFIX,spaceship.com
+DOMAIN-SUFFIX,ddns.synology.com
+DOMAIN-Keyword,lgdyvv6
+DOMAIN-SUFFIX,compass.mongodb.com
 
 # > WeChat's IPs
 IP-CIDR,101.226.211.0/24,no-resolve
