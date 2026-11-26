@@ -94,19 +94,28 @@
       return { token: m[1], slot: m[2] === undefined ? null : Number(m[2]) };
     });
   }
-  function fallbackMinutes() {
-    // 旧模块仍引用新 JS 时，兼容旧开关；新版只需填写分钟数。
-    if (params.fallback_minutes === undefined && params.fallback_enabled === "0") return 0;
-    var raw = String(params.fallback_minutes === undefined ? "30" : params.fallback_minutes).trim();
-    var allowed = [0, 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440];
-    if (!/^(0|[1-9]\d*)$/.test(raw) || allowed.indexOf(Number(raw)) < 0) {
-      throw new Error("兜底分钟数不支持；请使用 0、6、10、15、20、30、60、120 等文档列出的值。0 为关闭。");
+  function fallbackPlan() {
+    var enabled = String(params.fallback_enabled === undefined ? "1" : params.fallback_enabled).trim();
+    // 关闭优先于时间解析：禁用后不读取、不校验时间设置，不访问任何接口。
+    if (enabled === "0") return { unit: "off", value: 0, totalMinutes: 0, uniform: true };
+    if (enabled !== "1") throw new Error("fallback_enabled 请填写 0（关闭）或 1（开启）。");
+    var rawMinutes = String(params.fallback_minutes === undefined ? "30" : params.fallback_minutes).trim();
+    var rawHours = String(params.fallback_hours === undefined ? "0" : params.fallback_hours).trim();
+    if (!/^(0|[1-9]\d*)$/.test(rawMinutes) || !/^(0|[1-9]\d*)$/.test(rawHours) || Number(rawMinutes) > 59 || Number(rawHours) > 23) {
+      throw new Error("兜底参数无效：分钟请填 0–59，小时请填 0–23 的整数；1 小时请填分钟 0、小时 1。");
     }
-    return Number(raw);
+    var minutes = Number(rawMinutes), hours = Number(rawHours);
+    if (minutes > 0) return { unit: "minutes", value: minutes, totalMinutes: minutes, uniform: 60 % minutes === 0 };
+    if (hours > 0) return { unit: "hours", value: hours, totalMinutes: hours * 60, uniform: 24 % hours === 0 };
+    return { unit: "off", value: 0, totalMinutes: 0, uniform: true };
   }
   function scheduleLabel() {
-    try { var n = fallbackMinutes(); return n ? "兜底 " + n + " 分钟" : "兜底关闭"; }
-    catch (_) { return "兜底参数无效（查看说明）"; }
+    try {
+      var plan = fallbackPlan();
+      if (plan.unit === "off") return "兜底关闭";
+      var unit = plan.unit === "minutes" ? "分钟" : "小时";
+      return plan.uniform ? "兜底 " + plan.value + " " + unit : unit + "步进 " + plan.value;
+    } catch (_) { return "兜底参数无效（查看说明）"; }
   }
   function localAPI(path, body) {
     return new Promise(function (resolve, reject) {
@@ -333,8 +342,10 @@
     if (!supportedEvent && !isCron && !manual) { done(cached()); return; }
     // 调度时刻由 Surge cron 决定；此处只检查开关，不进行每分钟计时。
     if (isCron) {
-      var minutes = fallbackMinutes();
-      if (action !== "auto" || minutes === 0 || (params.scheduled_minutes !== undefined && Number(params.scheduled_minutes) !== minutes)) { done(); return; }
+      var plan = fallbackPlan();
+      if (action !== "auto" || plan.unit === "off" || (params.timer_unit && params.timer_unit !== plan.unit)) { done(); return; }
+      // 防止旧映射规则仍引用新脚本时按错误频率执行。
+      if (params.scheduled_minutes !== undefined && Number(params.scheduled_minutes) !== plan.totalMinutes) { done(); return; }
     }
     if (action === "auto" && !supportedEvent && !isCron && !manual) { done(); return; }
     var readonly = action === "status";
