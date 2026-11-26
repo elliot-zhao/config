@@ -1,4 +1,4 @@
-#!name=po0 防火墙（查询与加白）
+#!name=po0 防火墙（按节点自动查询与加白）
 #!desc=按实际请求的节点名称/关键词过滤，无需策略组参数；增加自定义 Wi-Fi/蜂窝排除和当前网络快捷排除面板；自动读取当前配置的 SSID Setting 挂起条件；状态查询与加白分成两个面板。分钟优先，分钟为 0 时使用小时；开关为 0 时关闭定时兜底。
 #!category=po0
 #!arguments=tokens:"",fallback_enabled:1,fallback_minutes:30,fallback_hours:0,exclude_ssids:"",exclude_cellular:0,show_network_panel:1,node_names:"",node_keywords:""
