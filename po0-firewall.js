@@ -35,11 +35,19 @@
     try { return $persistentStore.write(JSON.stringify(v), k); } catch (_) { return false; }
   }
   function current() { return generation === null || read(key + "_generation") === generation; }
-  function card(title, content, style) { return { title: title, content: content, style: style || "info" }; }
+  function card(title, content, tone) {
+    tone = tone || "info";
+    return { title: title, content: content, tone: tone,
+      icon: tone === "error" || tone === "alert" ? "exclamationmark.shield" : "checkmark.shield",
+      "icon-color": { good: "#34C759", info: "#007AFF", alert: "#FF9500", error: "#FF3B30" }[tone] || "#007AFF" };
+  }
   function done(value) {
     if (finished) return;
     finished = true;
-    if (panel || scriptType === "generic") $done(value || {}); else $done();
+    if (panel || scriptType === "generic") {
+      // style 会覆盖自定义图标；只把 Surge 支持的显示字段交给面板。
+      $done(value ? { title: value.title, content: value.content, icon: value.icon, "icon-color": value["icon-color"] } : {});
+    } else $done();
   }
   function redact(s) { return String(s).replace(/pgnfw_[A-Za-z0-9_-]+/g, "[token]"); }
   function notice(value) {
@@ -53,12 +61,26 @@
     return w.ssid ? "Wi-Fi：" + w.ssid : /^pdp_ip/.test(iface) ? "蜂窝网络" : "当前网络";
   }
   function cached() {
-    var snapshot = read(key + "_snapshot");
-    var last = read(key + "_add");
-    if (action === "add") {
-      return card("po0 · 立即加白", "点击本面板刷新按钮才执行加白。\n" + (last ? last.content : "尚未执行加白。"), last ? last.style : "info");
-    }
-    return card("po0 · 查询状态（只读）", (snapshot ? snapshot.content : "尚无查询记录。") + "\n这是本地历史记录；点击本面板刷新按钮查询服务端，不加白。", snapshot ? snapshot.style : "info");
+    var readonly = action !== "add", saved = read(key + (readonly ? "_snapshot" : "_add"));
+    if (saved && saved.layout === 2) return decorate(saved, readonly);
+    return card(readonly ? "po0 状态 · 只读" : "po0 手动加白",
+      (saved ? "已有旧记录，请刷新更新显示。" : "暂无记录") + "\n" +
+      (readonly ? "点刷新查询 · 不加白" : "点刷新执行加白") + "\n" + scheduleLabel());
+  }
+  function stamp(at) {
+    var d = new Date(at);
+    function two(n) { return (n < 10 ? "0" : "") + n; }
+    return two(d.getMonth() + 1) + "/" + two(d.getDate()) + " " + two(d.getHours()) + ":" + two(d.getMinutes());
+  }
+  function decorate(record, readonly) {
+    record.content = record.body + "\n\n记录 " + stamp(record.recordedAt) + " · " + record.source + "\n" +
+      (readonly ? "点刷新仅查询" : "点刷新加白") + " · " + scheduleLabel();
+    return record;
+  }
+  function messageCard(title, body, tone, readonly, source) {
+    var result = card(title, "", tone);
+    result.layout = 2; result.body = body; result.recordedAt = Date.now(); result.source = source;
+    return decorate(result, readonly);
   }
   function tokens() {
     var values = tokenText.split(/[,，|;、\s]+/).filter(Boolean), seen = {};
@@ -72,10 +94,19 @@
       return { token: m[1], slot: m[2] === undefined ? null : Number(m[2]) };
     });
   }
-  function fallbackEnabled() {
-    var s = String(params.fallback_enabled === undefined ? "1" : params.fallback_enabled).trim();
-    if (s !== "0" && s !== "1") throw new Error("fallback_enabled 请填 0（关闭）或 1（开启）；执行时刻由 fallback_cron 设置。");
-    return s === "1";
+  function fallbackMinutes() {
+    // 旧模块仍引用新 JS 时，兼容旧开关；新版只需填写分钟数。
+    if (params.fallback_minutes === undefined && params.fallback_enabled === "0") return 0;
+    var raw = String(params.fallback_minutes === undefined ? "30" : params.fallback_minutes).trim();
+    var allowed = [0, 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440];
+    if (!/^(0|[1-9]\d*)$/.test(raw) || allowed.indexOf(Number(raw)) < 0) {
+      throw new Error("兜底分钟数不支持；请使用 0、6、10、15、20、30、60、120 等文档列出的值。0 为关闭。");
+    }
+    return Number(raw);
+  }
+  function scheduleLabel() {
+    try { var n = fallbackMinutes(); return n ? "兜底 " + n + " 分钟" : "兜底关闭"; }
+    catch (_) { return "兜底参数无效（查看说明）"; }
   }
   function localAPI(path, body) {
     return new Promise(function (resolve, reject) {
@@ -250,20 +281,47 @@
     return normalize(response.data, item, readonly);
   }
   function slotLabel(entry) {
-    if (!entry.slotKnown) return "槽位信息未提供";
-    return entry.slot === null ? "普通条目（无固定槽位）" : "固定槽位 " + entry.slot;
+    if (!entry.slotKnown || entry.slot === undefined) return "槽位未知";
+    return entry.slot === null ? "普通" : "📌" + entry.slot;
   }
-  function describe(result, index, item, readonly) {
+  function protectedNow(result) {
+    return !result.error && result.enabled && result.ip !== "未知" && result.matching.length > 0;
+  }
+  function describe(result, index, item, readonly, sharedIp) {
     var head = "#" + (index + 1) + " ";
-    if (result.error) return head + "❌ " + result.error;
-    var headline = readonly ? "查询成功" : result.applied ? "加白成功" : "未确认加白生效";
-    var state = !result.enabled ? "防火墙未启用" : result.ip === "未知" ? "当前出口未知" : result.matching.length ? result.matching.map(slotLabel).join("、") : "当前出口不在白名单";
-    var lines = [head + headline + " · 出口 " + result.ip, "  " + state + " · 占用 " + result.list.length + "/" + result.limit];
-    if (item.slot !== null) lines.push("  配置的目标槽位：" + item.slot + (readonly ? "（本次仅查询，不调整）" : ""));
-    result.list.forEach(function (entry) {
-      lines.push("  " + entry.ip + " · " + slotLabel(entry) + (sameSubnet(entry.ip, result.ip) ? " ← 当前出口" : ""));
+    if (result.error) return head + "❌ 请求失败\n    " + result.error;
+    var ok = readonly ? protectedNow(result) : result.applied;
+    var state = !result.enabled ? "防火墙未启用" : result.ip === "未知" ? "出口未知" : !result.matching.length ? "不在白名单" :
+      !readonly && !result.applied ? "目标槽位未生效" : "当前 " + result.matching.map(slotLabel).join("、");
+    var lines = [head + (ok ? "✅ " : "⚠️ ") + result.list.length + "/" + result.limit + " · " + state];
+    if (!sharedIp) lines.push("    出口 " + result.ip);
+    // 只读显示实际槽位；配置的目标槽位不同才额外提示，不把目标当作结果。
+    if (item.slot !== null && !result.matching.some(function (entry) { return entry.slotKnown && entry.slot !== null && String(entry.slot) === String(item.slot); })) {
+      lines.push("    目标 📌" + item.slot + (readonly ? " · 本次只读" : ""));
+    }
+    var list = result.list.slice().sort(function (a, b) {
+      var sa = a.slotKnown && a.slot !== null ? Number(a.slot) : 99;
+      var sb = b.slotKnown && b.slot !== null ? Number(b.slot) : 99;
+      return sa - sb;
     });
+    list.forEach(function (entry) {
+      lines.push("    " + entry.ip + " " + slotLabel(entry) + (sameSubnet(entry.ip, result.ip) ? " ←" : ""));
+    });
+    if (!list.length) lines.push("    暂无白名单条目");
     return lines.join("\n");
+  }
+  function resultCard(results, entries, readonly, source) {
+    var count = results.filter(function (r) { return readonly ? protectedNow(r) : !r.error && r.applied; }).length;
+    var failed = results.some(function (r) { return r.error || !readonly && !r.ok; });
+    var ips = results.filter(function (r) { return !r.error; }).map(function (r) { return r.ip; });
+    var shared = ips.length > 0 && ips.every(function (ip) { return ip === ips[0]; });
+    var body = (shared ? "出口 " + ips[0] + "\n" : "") + results.map(function (r, i) {
+      return describe(r, i, entries[i], readonly, shared);
+    }).join("\n\n");
+    var result = messageCard("po0 " + (readonly ? "状态 " : "加白 ") + count + "/" + results.length + (readonly ? " · 只读" : ""), body,
+      failed ? "error" : count === results.length ? "good" : "alert", readonly, source);
+    result.signature = JSON.stringify(results);
+    return result;
   }
   async function main() {
     if (["auto", "add", "status"].indexOf(action) < 0) throw new Error("未知操作；未发送请求。");
@@ -274,7 +332,10 @@
     var manual = trigger === "button" || trigger === "intent" || trigger === "editor" || eventName === "manually" || (scriptType === "generic" && !eventName && !trigger);
     if (!supportedEvent && !isCron && !manual) { done(cached()); return; }
     // 调度时刻由 Surge cron 决定；此处只检查开关，不进行每分钟计时。
-    if (isCron && (action !== "auto" || !fallbackEnabled())) { done(); return; }
+    if (isCron) {
+      var minutes = fallbackMinutes();
+      if (action !== "auto" || minutes === 0 || (params.scheduled_minutes !== undefined && Number(params.scheduled_minutes) !== minutes)) { done(); return; }
+    }
     if (action === "auto" && !supportedEvent && !isCron && !manual) { done(); return; }
     var readonly = action === "status";
     if (!connected()) { done(card("po0 · 无网络", "未发送查询或加白请求。")); return; }
@@ -288,19 +349,17 @@
       var reason = await suspension();
       if (!current()) { done(); return; }
       if (reason) {
-        var skipped = card("po0 · 加白已跳过", networkLabel() + "\n" + reason + "\n" + new Date().toLocaleString());
+        var skipped = messageCard("po0 加白 · 已跳过", networkLabel() + "\n" + reason, "info", false, "挂起网络");
         write(key + "_add", skipped); done(skipped); return;
       }
     }
     var results = await Promise.all(entries.map(function (item) { return api(item, readonly, 1); }));
     if (!current() || results.some(function (r) { return r.cancelled; })) { done(); return; }
     var failed = results.some(function (r) { return r.error || !r.ok; });
-    var source = readonly ? "只读查询（未修改白名单）" : isCron ? "静默 IP 兜底" : supportedEvent ? eventName === "engine-started" ? "Surge 启动加白" : "网络变化加白" : "手动加白";
-    var content = source + " · " + new Date().toLocaleString() + "\n" + networkLabel() + "\n" + results.map(function (r, n) { return describe(r, n, entries[n], readonly); }).join("\n");
-    var result = card(readonly ? "po0 · 查询状态（只读）" : "po0 · 加白结果", content, failed ? "error" : readonly ? "info" : "good");
-    result.signature = JSON.stringify(results);
+    var source = readonly ? "只读查询" : isCron ? "定时加白" : supportedEvent ? eventName === "engine-started" ? "启动加白" : "网络加白" : "手动加白";
+    var result = resultCard(results, entries, readonly, source);
     var previous = read(key + "_snapshot");
-    if (results.some(function (r) { return !r.error; })) write(key + "_snapshot", result);
+    if (results.some(function (r) { return !r.error; })) write(key + "_snapshot", readonly ? result : resultCard(results, entries, true, source));
     if (!readonly) {
       write(key + "_add", result);
       if (manual || failed || !previous || previous.signature !== result.signature) notice(result);
@@ -308,7 +367,8 @@
     done(result);
   }
   main().catch(function (error) {
-    var result = card("po0 · 操作未完成", redact(error && error.message || "脚本异常"), "error");
+    var result = messageCard("po0 " + (action === "status" ? "查询" : "加白") + " · 未完成",
+      redact(error && error.message || "脚本异常"), "error", action === "status", "执行失败");
     if (attemptedWrite && current()) write(key + "_add", result);
     // 自动错误只在变化时通知，避免同一配置问题反复打扰。
     if (!panel && current() && read(key + "_error") !== result.content) { notice(result); write(key + "_error", result.content); }
