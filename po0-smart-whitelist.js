@@ -42,6 +42,8 @@
   // 设备上的模块级名单，不绑定 token；更新脚本、修改 token 后仍保留。
   var networkKey = "po0_firewall_network_exclusions_v1";
   var selectedNode = "";
+  var DIRECT_MODE = "当前为全局直连模式；不加白。";
+  var checkedAt = 0; // 本次节点检查读取请求记录的时间
 
   function read(k) {
     try { return JSON.parse($persistentStore.read(k) || "null"); } catch (_) { return null; }
@@ -102,34 +104,48 @@
   function networkExclusion() {
     var rules = networkRules(), currentNetwork = networkIdentity();
     if (!currentNetwork) {
-      if (rules.configured.length || rules.saved.ssids.length || rules.cellular || rules.saved.cellular) {
+      if (rules.configured.length || rules.saved.ssids.length || rules.cellular) {
         throw new Error("无法确认当前网络或读取 Wi-Fi 名称，不能判断排除名单；本次不加白。");
       }
       return "";
     }
+    // 蜂窝只由参数 exclude_cellular 决定；面板不能改蜂窝，旧版面板留下的蜂窝排除也不再生效。
     if (currentNetwork.type === "cellular") {
-      return rules.cellular || rules.saved.cellular ? "蜂窝网络已设为不加白。" : "";
+      return rules.cellular ? "蜂窝网络已由参数 exclude_cellular 设为不加白。" : "";
     }
     if (rules.configured.indexOf(currentNetwork.ssid) >= 0) return "此 Wi-Fi 已在模块参数的排除名单中。";
     if (rules.saved.ssids.indexOf(currentNetwork.ssid) >= 0) return "此 Wi-Fi 已在本地快捷排除名单中。";
     return "";
   }
-  function networkControl(change) {
+  // 排除面板，优先级：SSID Setting ＞ 参数（exclude_cellular / exclude_ssids）＞ 面板名单。
+  // 蜂窝完全只读；SSID Setting 命中或在 exclude_ssids 里的 Wi-Fi 只显示、不改名单。
+  async function networkControl(change) {
     var rules = networkRules(), identity = networkIdentity();
+    var tail = "\n仅控制自动加白 · 不影响 Surge 上网";
     if (!identity) return card("po0 网络排除 · 无法识别", "未更改名单。请连接 Wi-Fi 并允许读取名称，或使用蜂窝网络。", "alert");
-    var saved = rules.saved, localBlocked = identity.type === "cellular" ? saved.cellular : saved.ssids.indexOf(identity.ssid) >= 0;
-    var fixed = identity.type === "cellular" ? rules.cellular : rules.configured.indexOf(identity.ssid) >= 0;
+    if (identity.type === "cellular") {
+      return card("po0 网络排除 · " + (rules.cellular ? "已排除" : "未排除"), identity.label + "\n" +
+        "由参数 exclude_cellular 决定（当前为 " + (rules.cellular ? "1" : "0") + "），面板不可更改" + tail,
+        rules.cellular ? "alert" : "info");
+    }
+    var ssidHit = "", ssidError = "";
+    try { ssidHit = await suspension(); } catch (error) { ssidError = String(error && error.message || "无法读取 SSID Setting"); }
+    if (ssidHit) {
+      return card("po0 网络排除 · 已挂起", identity.label + "\n" +
+        "由 SSID Setting 挂起（优先级最高），不会自动加白\n面板不可更改" + tail, "alert");
+    }
+    var saved = rules.saved, localBlocked = saved.ssids.indexOf(identity.ssid) >= 0;
+    var fixed = rules.configured.indexOf(identity.ssid) >= 0;
     if (change && !fixed) {
-      if (identity.type === "cellular") saved.cellular = !localBlocked;
-      else if (localBlocked) saved.ssids = saved.ssids.filter(function (s) { return s !== identity.ssid; });
+      if (localBlocked) saved.ssids = saved.ssids.filter(function (s) { return s !== identity.ssid; });
       else saved.ssids.push(identity.ssid);
       if (!write(networkKey, saved)) throw new Error("保存网络排除设置失败；未更改名单。");
       localBlocked = !localBlocked;
     }
     var blocked = fixed || localBlocked;
     return card("po0 网络排除 · " + (blocked ? "已排除" : "未排除"), identity.label + "\n" +
-      (fixed ? "由模块参数排除，请修改对应参数解除。" : localBlocked ? "点刷新解除本地排除" : "点刷新将当前网络设为不加白") +
-      "\n仅控制加白 · 不影响 Surge 上网\n仍遵守 SSID Setting 挂起配置", blocked ? "alert" : "info");
+      (fixed ? "参数里已排除，请去参数 exclude_ssids 里删除" : localBlocked ? "点刷新解除排除" : "点刷新将当前 Wi-Fi 设为不自动加白") +
+      (ssidError ? "\n⚠️ " + ssidError.replace(/；?本次不加白。?$/, "") : "") + tail, blocked ? "alert" : "info");
   }
   function cached() {
     var readonly = action !== "add", saved = read(key + (readonly ? "_snapshot" : "_add"));
@@ -243,7 +259,8 @@
     if (Array.isArray(value)) return value;
     throw new Error("Surge " + label + "格式无法识别；本次不加白。");
   }
-  function requestCandidate(row, active, floor, now) {
+  // floor：当前网络的边界（切网时间）；recentFloor：上次检查的时间（没有就等于 floor）。
+  function requestCandidate(row, active, floor, recentFloor, now) {
     if (!row || typeof row !== "object") return false;
     if (row.rejected === true || /^rejected$/i.test(String(row.status || ""))) return false;
     var start = requestTime(row.startDate), end = requestTime(row.completedDate);
@@ -254,26 +271,36 @@
       return end === null && row.completed !== true && row.disconnected !== true && row.failed !== true &&
         !/^(?:complete|completed|closed|disconnected|failed|error|finished|rejected|cancelled|canceled)$/i.test(String(row.status || ""));
     }
+    // 已结束的请求：上次检查以来在这个网络上有过活动就算。
     var activity = end !== null ? end : start;
-    return activity !== null && now - activity >= 0 && now - activity <= 60000;
+    return activity !== null && activity >= recentFloor && activity <= now;
+  }
+  // 记下这次检查的时间，下次检查只看这之后的请求。
+  function markChecked() {
+    if (!checkedAt) return;
+    write(key + "_last_check", { fingerprint: requestNetworkMark(), at: checkedAt });
   }
   async function nodeRestriction() {
     var filter = nodeFilter();
     if (!filter) return "";
     selectedNode = "";
     var mode = await localAPI("/v1/outbound", {}, "出站模式");
-    if (mode.mode === "direct") return "当前为全局直连模式；不加白。";
+    if (mode.mode === "direct") return DIRECT_MODE;
     if (mode.mode !== "rule" && mode.mode !== "proxy") throw new Error("无法确认 Surge 出站模式；本次不加白。");
     var mark = read(key + "_request_network");
     if (!mark || mark.fingerprint !== requestNetworkMark() || typeof mark.since !== "number" || !isFinite(mark.since) || mark.since < 0 || mark.since > Date.now()) {
       throw new Error("网络环境已变化或请求边界不可读；等待下一次触发。");
     }
+    var last = read(key + "_last_check");
+    var recentFloor = last && last.fingerprint === mark.fingerprint && typeof last.at === "number" && isFinite(last.at) &&
+      last.at >= mark.since && last.at <= Date.now() ? last.at : mark.since;
     var active = requestRows(await localAPI("/v1/requests/active", {}, "活动请求"), "活动请求");
     var recent = requestRows(await localAPI("/v1/requests/recent", {}, "近期请求"), "近期请求");
     var now = Date.now(), candidates = [];
+    checkedAt = now;
     function collect(rows, isActive) {
       rows.forEach(function (row) {
-        if (!requestCandidate(row, isActive, mark.since, now)) return;
+        if (!requestCandidate(row, isActive, mark.since, recentFloor, now)) return;
         // 只读该次请求的最终策略；不匹配 originalPolicyName、规则、URL 或备注。
         if (typeof row.policyName !== "string" || !row.policyName) return;
         var name = row.policyName;
@@ -282,7 +309,7 @@
       });
     }
     collect(active, true); collect(recent, false);
-    if (!candidates.length) return "未发现当前网络上的活动代理请求或最近 60 秒的有效请求；未加白。";
+    if (!candidates.length) return "上次检查以来，当前网络上没有代理请求；未加白。";
     // 列表只用于识别策略组名/外置节点标识，不读取任何组的当前选择。
     var all = await localAPI("/v1/policies", { include_external: true }, "策略类型列表");
     var groupRows = Array.isArray(all["policy-groups"]) ? all["policy-groups"] : all.groups;
@@ -436,11 +463,12 @@
       limit: data.limit === undefined ? "?" : data.limit, matching: matching, applied: applied,
       ok: readonly || applied };
   }
-  async function api(item, readonly, attempt) {
+  // force=true：「po0 手动加白」，不看节点、SSID Setting 和排除名单。
+  async function api(item, readonly, attempt, force) {
     if (!current()) return { cancelled: true };
     // 排除名单可能在等待配置读取或重试期间被另一个面板操作更新。
-    if (!readonly) { var excluded = networkExclusion(); if (excluded) return { error: excluded }; }
-    if (!readonly && attempt > 1) {
+    if (!readonly && !force) { var excluded = networkExclusion(); if (excluded) return { error: excluded }; }
+    if (!readonly && !force && attempt > 1) {
       var nodeReason = await nodeRestriction();
       if (!current()) return { cancelled: true };
       if (nodeReason) return { error: nodeReason };
@@ -462,10 +490,17 @@
     });
     if (!current()) return { cancelled: true };
     var retry = response.error || !response.status || response.status >= 500 || (response.status === 400 && !response.data);
-    if (retry && attempt < 3) { await wait(1500 * attempt); return api(item, readonly, attempt + 1); }
+    if (retry && attempt < 3) { await wait(1500 * attempt); return api(item, readonly, attempt + 1, force); }
     if (response.error || !response.status) return { error: "网络请求失败（共尝试 " + attempt + " 次）" };
     if (response.status < 200 || response.status >= 300) return { error: "HTTP " + response.status + (response.status === 403 ? "：请检查 token 权限/固定槽位冲突" : "") };
     return normalize(response.data, item, readonly);
+  }
+  // 手动加白：先只读查询，当前出口（含目标槽位）已在白名单就不再添加。
+  async function ensure(item) {
+    var status = await api(item, true, 1, true);
+    if (status.cancelled || status.error) return status;
+    if (status.applied) { status.ok = true; status.already = true; return status; }
+    return api(item, false, 1, true);
   }
   function slotLabel(entry) {
     if (!entry.slotKnown || entry.slot === undefined) return "槽位未知";
@@ -480,7 +515,8 @@
     var ok = readonly ? protectedNow(result) : result.applied;
     var state = !result.enabled ? "防火墙未启用" : result.ip === "未知" ? "出口未知" : !result.matching.length ? "不在白名单" :
       !readonly && !result.applied ? "目标槽位未生效" : "当前 " + result.matching.map(slotLabel).join("、");
-    var lines = [head + (ok ? "✅ " : "⚠️ ") + result.list.length + "/" + result.limit + " · " + state];
+    var lines = [head + (ok ? "✅ " : "⚠️ ") + result.list.length + "/" + result.limit + " · " + state +
+      (result.already ? " · 已在白名单，未重复添加" : "")];
     if (!sharedIp) lines.push("    出口 " + result.ip);
     // 只读显示实际槽位；配置的目标槽位不同才额外提示，不把目标当作结果。
     if (item.slot !== null && !result.matching.some(function (entry) { return entry.slotKnown && entry.slot !== null && String(entry.slot) === String(item.slot); })) {
@@ -513,7 +549,7 @@
   async function main() {
     if (action === "network_toggle") {
       var change = panel ? trigger === "button" : trigger === "intent" || trigger === "editor" || trigger === "button";
-      done(networkControl(change)); return;
+      done(await networkControl(change)); return;
     }
     if (action === "network_clear") {
       if (panel || scriptType !== "generic" || ["button", "intent", "editor", ""].indexOf(trigger) < 0) { done(); return; }
@@ -536,27 +572,45 @@
     }
     if (action === "auto" && !supportedEvent && !isCron && !manual) { done(); return; }
     var readonly = action === "status";
+    // 「po0 手动加白」：跳过节点过滤、SSID Setting 和排除名单，只做「先查后加」。
+    var force = action === "add" && manual && !isCron && !supportedEvent;
     if (!connected()) { done(card("po0 · 无网络", "未发送查询或加白请求。")); return; }
     var entries = tokens();
+    var nodeChecked = false;
     if (!readonly) {
       attemptedWrite = true;
       generation = String(Date.now()) + "_" + Math.random().toString(36).slice(2);
       if (!write(key + "_generation", generation)) throw new Error("无法写入本地执行记录；本次不加白。");
       observeRequestNetwork();
-      if (supportedEvent) await wait(2000);
-      if (!current()) { done(); return; }
-      var reason = networkExclusion() || await suspension();
-      // 挂起/排除先行；节点检查放在配置读取之后，缩短判断与 POST 之间的时间。
-      if (!reason) reason = await nodeRestriction();
-      if (!current()) { done(); return; }
-      if (reason) {
-        var skipped = messageCard("po0 加白 · 已跳过", networkLabel() + "\n" + reason, "info", false, "条件检查");
-        write(key + "_add", skipped); done(decorate(skipped, false)); return;
+      if (!force) {
+        if (supportedEvent) await wait(2000);
+        if (!current()) { done(); return; }
+        var reason = networkExclusion() || await suspension();
+        // 挂起/排除先行；节点检查放在配置读取之后，缩短判断与 POST 之间的时间。
+        if (!reason) {
+          reason = await nodeRestriction();
+          // 换网络/启动后刚开始可能还没有请求：约 10 秒、30 秒时再各看一次（只读本地记录）。
+          var later = supportedEvent ? [8000, 20000] : [];
+          for (var round = 0; reason && reason !== DIRECT_MODE && round < later.length; round++) {
+            await wait(later[round]);
+            if (!current()) { done(); return; }
+            reason = await nodeRestriction();
+          }
+          nodeChecked = !!nodeFilter();
+        }
+        if (!current()) { done(); return; }
+        if (reason) {
+          if (nodeChecked) markChecked();
+          var skipped = messageCard("po0 加白 · 已跳过", networkLabel() + "\n" + reason, "info", false, "条件检查");
+          write(key + "_add", skipped); done(decorate(skipped, false)); return;
+        }
       }
     }
-    var results = await Promise.all(entries.map(function (item) { return api(item, readonly, 1); }));
+    var results = await Promise.all(entries.map(function (item) { return force ? ensure(item) : api(item, readonly, 1); }));
     if (!current() || results.some(function (r) { return r.cancelled; })) { done(); return; }
     var failed = results.some(function (r) { return r.error || !r.ok; });
+    // 自动加白成功后才推进「上次检查」时间；失败时保留，下次检查还会算上这段时间的请求。
+    if (nodeChecked && !failed) markChecked();
     var source = readonly ? "只读查询" : isCron ? "定时加白" : supportedEvent ? eventName === "engine-started" ? "启动加白" : "网络加白" : "手动加白";
     var result = resultCard(results, entries, readonly, source);
     var previous = read(key + "_snapshot");
