@@ -19,8 +19,8 @@
     params.exclude_ssids = argumentsText.slice(ssidArgument + "&exclude_ssids=".length);
     argumentsText = argumentsText.slice(0, ssidArgument);
   }
-  // 从后往前拆原文参数；兼容旧模块传入的 policy_group，但不再用它筛选节点。
-  ["node_keywords", "node_names", "policy_group"].forEach(function (name) {
+  // 从后往前拆原文参数（策略组名、节点名里可能有 & 等字符）；兼容旧模块传入的 policy_group，但不再用它筛选节点。
+  ["select_groups", "node_keywords", "node_names", "policy_group"].forEach(function (name) {
     var marker = "&" + name + "=", at = argumentsText.indexOf(marker);
     if (at >= 0) { params[name] = argumentsText.slice(at + marker.length); argumentsText = argumentsText.slice(0, at); }
   });
@@ -75,66 +75,89 @@
   function networkLabel() {
     var w = network.wifi || {};
     var iface = (network.v4 || {}).primaryInterface || (network.v6 || {}).primaryInterface || "";
-    return w.ssid ? "Wi-Fi：" + w.ssid : /^pdp_ip/.test(iface) ? "蜂窝网络" : "当前网络";
+    var carrier = String((network["cellular-data"] || {}).carrier || "").trim();
+    return w.ssid ? "Wi-Fi：" + w.ssid : /^pdp_ip/.test(iface) ? "蜂窝网络" + (carrier ? "：" + carrier : "") : "当前网络";
   }
   function networkIdentity() {
     var w = network.wifi || {}, v4 = network.v4 || {}, v6 = network.v6 || {};
     var interfaces = [v4.primaryInterface, v6.primaryInterface].filter(Boolean);
     var cellular = interfaces.some(function (v) { return /^pdp_ip/.test(v); });
     if (!connected() || cellular && (w.ssid || w.bssid || interfaces.some(function (v) { return !/^pdp_ip/.test(v); }))) return null;
-    if (cellular) return { type: "cellular", label: "蜂窝网络" };
+    if (cellular) {
+      // 运营商标识只用 Surge 返回的 carrier 原值，不做解释。
+      var carrier = String((network["cellular-data"] || {}).carrier || "").trim();
+      return { type: "cellular", carrier: carrier, label: "蜂窝网络" + (carrier ? "：" + carrier : "") };
+    }
     if (typeof w.ssid === "string" && w.ssid.length) return { type: "wifi", ssid: w.ssid, label: "Wi-Fi：" + w.ssid };
     return null;
   }
   function networkRules() {
-    var flag = String(params.exclude_cellular === undefined ? "0" : params.exclude_cellular).trim();
-    if (flag !== "0" && flag !== "1") throw new Error("exclude_cellular 请填 0 或 1；本次不加白。");
+    // lock_cellular：1（默认）锁定，蜂窝始终自动加白、面板不能排除；0 允许在面板按运营商排除。
+    var lock = String(params.lock_cellular === undefined ? "1" : params.lock_cellular).trim();
+    if (lock !== "0" && lock !== "1") throw new Error("lock_cellular 请填 0 或 1；本次不加白。");
     var raw;
     try { raw = $persistentStore.read(networkKey); } catch (_) { throw new Error("无法读取本地网络排除名单；本次不加白。"); }
-    var saved = { ssids: [], cellular: false };
+    var saved = { ssids: [], cellular: false, carriers: [] };
     if (raw) {
       try { saved = JSON.parse(raw); } catch (_) { throw new Error("本地网络排除名单损坏；请运行清空排除脚本后重新设置。"); }
-      if (!saved || !Array.isArray(saved.ssids) || saved.ssids.some(function (v) { return typeof v !== "string" || !v.length; }) || typeof saved.cellular !== "boolean") {
+      if (saved && typeof saved === "object" && saved.carriers === undefined) saved.carriers = []; // 旧版名单没有运营商这一项
+      if (!saved || !Array.isArray(saved.ssids) || saved.ssids.some(function (v) { return typeof v !== "string" || !v.length; }) || typeof saved.cellular !== "boolean" ||
+        !Array.isArray(saved.carriers) || saved.carriers.some(function (v) { return typeof v !== "string" || !v.length; })) {
         throw new Error("本地网络排除名单格式无效；请运行清空排除脚本后重新设置。");
       }
     }
     return { configured: String(params.exclude_ssids || "").split("|").map(function (s) { return s.trim(); }).filter(Boolean),
-      cellular: flag === "1", saved: saved };
+      lockCellular: lock === "1", saved: saved };
   }
   function networkExclusion() {
     var rules = networkRules(), currentNetwork = networkIdentity();
     if (!currentNetwork) {
-      if (rules.configured.length || rules.saved.ssids.length || rules.cellular) {
+      if (rules.configured.length || rules.saved.ssids.length || !rules.lockCellular && rules.saved.carriers.length) {
         throw new Error("无法确认当前网络或读取 Wi-Fi 名称，不能判断排除名单；本次不加白。");
       }
       return "";
     }
-    // 蜂窝只由参数 exclude_cellular 决定；面板不能改蜂窝，旧版面板留下的蜂窝排除也不再生效。
+    // 蜂窝：lock_cellular=1 时一律加白；=0 时看面板记下的运营商。旧版面板的「整体蜂窝排除」不再生效。
     if (currentNetwork.type === "cellular") {
-      return rules.cellular ? "蜂窝网络已由参数 exclude_cellular 设为不加白。" : "";
+      if (rules.lockCellular || !currentNetwork.carrier) return "";
+      return rules.saved.carriers.indexOf(currentNetwork.carrier) >= 0 ? "此蜂窝网络（" + currentNetwork.carrier + "）已在面板排除名单中。" : "";
     }
     if (rules.configured.indexOf(currentNetwork.ssid) >= 0) return "此 Wi-Fi 已在模块参数的排除名单中。";
     if (rules.saved.ssids.indexOf(currentNetwork.ssid) >= 0) return "此 Wi-Fi 已在本地快捷排除名单中。";
     return "";
   }
-  // 排除面板，优先级：SSID Setting ＞ 参数（exclude_cellular / exclude_ssids）＞ 面板名单。
-  // 蜂窝完全只读；SSID Setting 命中或在 exclude_ssids 里的 Wi-Fi 只显示、不改名单。
+  // 排除面板，优先级：SSID Setting ＞ 参数（lock_cellular / exclude_ssids）＞ 面板名单。
+  // SSID Setting 命中、lock_cellular=1 的蜂窝、exclude_ssids 里的 Wi-Fi：只显示，不改名单。
   async function networkControl(change) {
     var rules = networkRules(), identity = networkIdentity();
     var tail = "\n仅控制自动加白 · 不影响 Surge 上网";
     if (!identity) return card("po0 网络排除 · 无法识别", "未更改名单。请连接 Wi-Fi 并允许读取名称，或使用蜂窝网络。", "alert");
-    if (identity.type === "cellular") {
-      return card("po0 网络排除 · " + (rules.cellular ? "已排除" : "未排除"), identity.label + "\n" +
-        "由参数 exclude_cellular 决定（当前为 " + (rules.cellular ? "1" : "0") + "），面板不可更改" + tail,
-        rules.cellular ? "alert" : "info");
-    }
     var ssidHit = "", ssidError = "";
     try { ssidHit = await suspension(); } catch (error) { ssidError = String(error && error.message || "无法读取 SSID Setting"); }
     if (ssidHit) {
       return card("po0 网络排除 · 已挂起", identity.label + "\n" +
         "由 SSID Setting 挂起（优先级最高），不会自动加白\n面板不可更改" + tail, "alert");
     }
-    var saved = rules.saved, localBlocked = saved.ssids.indexOf(identity.ssid) >= 0;
+    var warn = ssidError ? "\n⚠️ " + ssidError.replace(/；?本次不加白。?$/, "") : "";
+    var saved = rules.saved;
+    if (identity.type === "cellular") {
+      if (rules.lockCellular) {
+        return card("po0 网络排除 · 未排除", identity.label + "\n已锁定（lock_cellular=1）：蜂窝始终自动加白，面板不可排除" + warn + tail, "info");
+      }
+      if (!identity.carrier) {
+        return card("po0 网络排除 · 无法识别", identity.label + "\nSurge 没有返回运营商信息，无法按运营商排除；未更改名单" + warn + tail, "alert");
+      }
+      var cellBlocked = saved.carriers.indexOf(identity.carrier) >= 0;
+      if (change) {
+        if (cellBlocked) saved.carriers = saved.carriers.filter(function (c) { return c !== identity.carrier; });
+        else saved.carriers.push(identity.carrier);
+        if (!write(networkKey, saved)) throw new Error("保存网络排除设置失败；未更改名单。");
+        cellBlocked = !cellBlocked;
+      }
+      return card("po0 网络排除 · " + (cellBlocked ? "已排除" : "未排除"), identity.label + "\n" +
+        (cellBlocked ? "点刷新解除排除" : "点刷新将当前运营商设为不自动加白") + warn + tail, cellBlocked ? "alert" : "info");
+    }
+    var localBlocked = saved.ssids.indexOf(identity.ssid) >= 0;
     var fixed = rules.configured.indexOf(identity.ssid) >= 0;
     if (change && !fixed) {
       if (localBlocked) saved.ssids = saved.ssids.filter(function (s) { return s !== identity.ssid; });
@@ -145,7 +168,7 @@
     var blocked = fixed || localBlocked;
     return card("po0 网络排除 · " + (blocked ? "已排除" : "未排除"), identity.label + "\n" +
       (fixed ? "参数里已排除，请去参数 exclude_ssids 里删除" : localBlocked ? "点刷新解除排除" : "点刷新将当前 Wi-Fi 设为不自动加白") +
-      (ssidError ? "\n⚠️ " + ssidError.replace(/；?本次不加白。?$/, "") : "") + tail, blocked ? "alert" : "info");
+      warn + tail, blocked ? "alert" : "info");
   }
   function cached() {
     var readonly = action !== "add", saved = read(key + (readonly ? "_snapshot" : "_add"));
@@ -294,6 +317,41 @@
     var last = read(key + "_last_check");
     var recentFloor = last && last.fingerprint === mark.fingerprint && typeof last.at === "number" && isFinite(last.at) &&
       last.at >= mark.since && last.at <= Date.now() ? last.at : mark.since;
+    // 策略组列表：用于区分策略组和节点、把外部节点标识换成名称。
+    var all = await localAPI("/v1/policies", { include_external: true }, "策略类型列表");
+    var groupRows = Array.isArray(all["policy-groups"]) ? all["policy-groups"] : all.groups;
+    if (!Array.isArray(groupRows)) throw new Error("无法区分请求中的策略组与节点；本次不加白。");
+    var groups = groupRows.map(function (entry) { return typeof entry === "string" ? entry : entry && entry.name; });
+    if (groups.some(function (name) { return typeof name !== "string" || !name; })) throw new Error("Surge 策略组列表格式无法识别；本次不加白。");
+    var external = Array.isArray(all["external-policies"]) ? all["external-policies"] : [];
+    // 返回节点名；是策略组或无法确认时返回 null。
+    function nodeName(candidate) {
+      if (groups.indexOf(candidate) >= 0) return null;
+      var name = candidate;
+      if (/^POLICY::/.test(name)) {
+        var mapped = external.filter(function (p) { return p && p.identifier === name && typeof p.name === "string"; });
+        if (mapped.length !== 1 || !mapped[0].name) return null;
+        name = mapped[0].name;
+      }
+      return groups.indexOf(name) >= 0 ? null : name;
+    }
+    function hits(name) {
+      return filter.names.indexOf(name) >= 0 || filter.keywords.some(function (word) { return name.toLowerCase().indexOf(word.toLowerCase()) >= 0; });
+    }
+    function show(list, suffix) {
+      selectedNode = list.slice(0, 3).join("、") + (list.length > 3 ? " 等 " + list.length + " 个" : "") + suffix;
+    }
+    // 1) select_groups 指定的手动选择组当前选中的节点：顺着嵌套的 select 组往下找，只认节点，不认策略组名。
+    var picked = [], pickedGroups = [];
+    selectedChains().forEach(function (entry) {
+      var name = nodeName(entry.name);
+      if (!name || !hits(name)) return;
+      if (picked.indexOf(name) < 0) picked.push(name);
+      if (pickedGroups.indexOf(entry.group) < 0) pickedGroups.push(entry.group);
+    });
+    checkedAt = Date.now();
+    if (picked.length) { show(picked, "（" + pickedGroups.slice(0, 2).join("、") + " 选中）"); return ""; }
+    // 2) 上次检查以来、当前网络上的请求记录。
     var active = requestRows(await localAPI("/v1/requests/active", {}, "活动请求"), "活动请求");
     var recent = requestRows(await localAPI("/v1/requests/recent", {}, "近期请求"), "近期请求");
     var now = Date.now(), candidates = [];
@@ -309,30 +367,48 @@
       });
     }
     collect(active, true); collect(recent, false);
-    if (!candidates.length) return "上次检查以来，当前网络上没有代理请求；未加白。";
-    // 列表只用于识别策略组名/外置节点标识，不读取任何组的当前选择。
-    var all = await localAPI("/v1/policies", { include_external: true }, "策略类型列表");
-    var groupRows = Array.isArray(all["policy-groups"]) ? all["policy-groups"] : all.groups;
-    if (!Array.isArray(groupRows)) throw new Error("无法区分请求中的策略组与节点；本次不加白。");
-    var groups = groupRows.map(function (entry) { return typeof entry === "string" ? entry : entry && entry.name; });
-    if (groups.some(function (name) { return typeof name !== "string" || !name; })) throw new Error("Surge 策略组列表格式无法识别；本次不加白。");
-    var external = Array.isArray(all["external-policies"]) ? all["external-policies"] : [];
+    if (!candidates.length) return "上次检查以来没有代理请求，手动选择组也没有选中指定节点；未加白。";
     var matched = [], unresolved = false;
     candidates.forEach(function (candidate) {
-      if (groups.indexOf(candidate) >= 0) { unresolved = true; return; }
-      var name = candidate;
-      if (/^POLICY::/.test(name)) {
-        var mapped = external.filter(function (p) { return p && p.identifier === name && typeof p.name === "string"; });
-        if (mapped.length !== 1 || !mapped[0].name) { unresolved = true; return; }
-        name = mapped[0].name;
-      }
-      if (groups.indexOf(name) >= 0) { unresolved = true; return; }
-      var match = filter.names.indexOf(name) >= 0 || filter.keywords.some(function (word) { return name.toLowerCase().indexOf(word.toLowerCase()) >= 0; });
-      if (match && matched.indexOf(name) < 0) matched.push(name);
+      var name = nodeName(candidate);
+      if (!name) { unresolved = true; return; }
+      if (hits(name) && matched.indexOf(name) < 0) matched.push(name);
     });
-    if (!matched.length) return unresolved ? "请求尚未提供可确认的最终节点，或已知节点未匹配；未加白。" : "实际请求的节点未匹配指定名称或关键词；未加白。";
-    selectedNode = matched.slice(0, 3).join("、") + (matched.length > 3 ? " 等 " + matched.length + " 个" : "");
+    if (!matched.length) {
+      return unresolved ? "请求尚未提供可确认的最终节点，或已知节点未匹配；手动选择组也没有选中指定节点；未加白。" :
+        "实际请求的节点未匹配指定名称或关键词，手动选择组也没有选中；未加白。";
+    }
+    show(matched, "");
     return "";
+  }
+  // select_groups：组名里包含的文字，多个用 | 分隔，不分大小写；不填则不做「选中」判断。
+  function selectGroupWords() {
+    return String(params.select_groups || "").split("|").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+  }
+  // 名称匹配 select_groups 的手动选择组当前选中的策略，含嵌套 select 组一路往下的每一层。
+  // 返回 [{ group: 起点组名, name: 选中的策略名 }]；没填参数或读不到时返回空列表。
+  function selectedChains() {
+    var words = selectGroupWords();
+    if (!words.length) return [];
+    var details = null;
+    try {
+      if (typeof $surge !== "undefined" && $surge && typeof $surge.selectGroupDetails === "function") details = $surge.selectGroupDetails();
+    } catch (_) {}
+    var decisions = details && details.decisions;
+    if (!decisions || typeof decisions !== "object") return [];
+    var out = [];
+    Object.keys(decisions).forEach(function (group) {
+      var lower = group.toLowerCase();
+      if (!words.some(function (w) { return lower.indexOf(w) >= 0; })) return;
+      var seen = {}, cur = decisions[group], depth = 0;
+      while (typeof cur === "string" && cur && !seen[cur] && depth < 16) {
+        seen[cur] = true;
+        out.push({ group: group, name: cur });
+        cur = decisions[cur];
+        depth++;
+      }
+    });
+    return out;
   }
   // 注释分隔符只在引号外、且行首或前有空格时生效。
   function withoutComment(line) {
@@ -495,12 +571,13 @@
     if (response.status < 200 || response.status >= 300) return { error: "HTTP " + response.status + (response.status === 403 ? "：请检查 token 权限/固定槽位冲突" : "") };
     return normalize(response.data, item, readonly);
   }
-  // 手动加白：先只读查询，当前出口（含目标槽位）已在白名单就不再添加。
-  async function ensure(item) {
-    var status = await api(item, true, 1, true);
+  // 先查后加（手动和自动都用）：先只读查询，当前出口（含目标槽位）已在白名单就不再添加。
+  // force=true 是手动加白，添加时不再检查排除名单；自动加白在添加前仍会重新检查排除名单。
+  async function ensure(item, force) {
+    var status = await api(item, true, 1, force);
     if (status.cancelled || status.error) return status;
     if (status.applied) { status.ok = true; status.already = true; return status; }
-    return api(item, false, 1, true);
+    return api(item, false, 1, force);
   }
   function slotLabel(entry) {
     if (!entry.slotKnown || entry.slot === undefined) return "槽位未知";
@@ -553,8 +630,8 @@
     }
     if (action === "network_clear") {
       if (panel || scriptType !== "generic" || ["button", "intent", "editor", ""].indexOf(trigger) < 0) { done(); return; }
-      if (!write(networkKey, { ssids: [], cellular: false })) throw new Error("清空本地网络排除名单失败。");
-      done(card("po0 网络排除 · 已清空", "仅清空快捷添加的名单；模块参数和挂起配置继续生效。")); return;
+      if (!write(networkKey, { ssids: [], cellular: false, carriers: [] })) throw new Error("清空本地网络排除名单失败。");
+      done(card("po0 网络排除 · 已清空", "仅清空面板添加的 Wi-Fi 和运营商；模块参数和挂起配置继续生效。")); return;
     }
     if (["auto", "add", "status"].indexOf(action) < 0) throw new Error("未知操作；未发送请求。");
     // 面板进入页面、周期更新或未确认的触发来源一律只显示缓存。
@@ -589,8 +666,8 @@
         // 挂起/排除先行；节点检查放在配置读取之后，缩短判断与 POST 之间的时间。
         if (!reason) {
           reason = await nodeRestriction();
-          // 换网络/启动后刚开始可能还没有请求：约 10 秒、30 秒时再各看一次（只读本地记录）。
-          var later = supportedEvent ? [8000, 20000] : [];
+          // 换网络/启动后：在约 2、15、30、45 秒各看一次（只读本地记录，脚本 timeout 为 60 秒）。
+          var later = supportedEvent ? [13000, 15000, 15000] : [];
           for (var round = 0; reason && reason !== DIRECT_MODE && round < later.length; round++) {
             await wait(later[round]);
             if (!current()) { done(); return; }
@@ -606,7 +683,7 @@
         }
       }
     }
-    var results = await Promise.all(entries.map(function (item) { return force ? ensure(item) : api(item, readonly, 1); }));
+    var results = await Promise.all(entries.map(function (item) { return readonly ? api(item, true, 1) : ensure(item, force); }));
     if (!current() || results.some(function (r) { return r.cancelled; })) { done(); return; }
     var failed = results.some(function (r) { return r.error || !r.ok; });
     // 自动加白成功后才推进「上次检查」时间；失败时保留，下次检查还会算上这段时间的请求。
