@@ -1,8 +1,8 @@
 #!name=po0 防火墙（按节点自动查询与加白）
-#!desc=按实际请求的节点名称/关键词过滤，无需策略组参数；增加自定义 Wi-Fi/蜂窝排除和当前网络快捷排除面板；自动读取当前配置的 SSID Setting 挂起条件；状态查询与加白分成两个面板。分钟优先，分钟为 0 时使用小时；开关为 0 时关闭定时兜底。
+#!desc=换网络、启动和定时检查时，上次检查以来走过指定节点才自动加白；可按 Wi-Fi、蜂窝排除，并遵守 SSID Setting 挂起。「po0 手动加白」不受这些限制，先查后加。
 #!category=po0
 #!arguments=tokens:"",fallback_enabled:1,fallback_minutes:30,fallback_hours:0,exclude_ssids:"",exclude_cellular:0,show_network_panel:1,node_names:"",node_keywords:""
-#!arguments-desc=node_keywords：实际请求使用的节点名称关键词，多个用 | 分隔；无需填写策略组。node_names：节点完整名称，多个用 | 分隔；命中任一名称或关键词即可。两项全空关闭过滤。检查活动请求及最近60秒的有效记录；60秒是记录有效期，不新增定时。exclude_ssids：不加白的 Wi-Fi 完整名称，多个用 | 分隔；含双引号或 | 的名称请用快捷面板添加。exclude_cellular：1 不在蜂窝网络加白，0 不限制。show_network_panel：1 显示快捷排除面板，0 隐藏。快捷面板自动读取当前 Wi-Fi，点刷新切换本地排除；蜂窝网络同样支持。fallback_enabled：1 开启定时兜底，0 禁用全部定时任务（时间设置不生效）。tokens：原 pgnfw_ token，多个用英文逗号分隔，可选 @0 至 @4。fallback_minutes：0–59 的整数，默认 30；大于 0 时优先使用。fallback_hours：0–23 的整数，默认 0；仅分钟为 0 时生效。两者均为 0 关闭。1小时填分钟0/小时1，2小时填分钟0/小时2。原生 cron 按时钟步进，不增加轮询；不能整除60的分钟值/不能整除24的小时值，跨小时/跨天的末段间隔会缩短。
+#!arguments-desc=【基本】\ntokens：po0 防火墙 token，多个用英文逗号分隔；固定槽位在末尾加 @0～@4\n\n【定时兜底】\nfallback_enabled：1 开启，0 关闭（关闭后下面两项不生效）\nfallback_minutes：每隔几分钟检查一次，0～59，默认 30；大于 0 时优先\nfallback_hours：分钟为 0 时，每隔几小时检查一次，0～23，默认 0\n例：每 1 小时 → 分钟 0、小时 1；两项都为 0 → 关闭\n\n【不自动加白的网络】\nexclude_ssids：Wi-Fi 完整名称，多个用 | 分隔；名称太长或含 | 和英文双引号时，用「po0 网络排除」面板添加\nexclude_cellular：1 蜂窝网络不自动加白，0 不限制；面板不能改蜂窝\nshow_network_panel：1 显示「po0 网络排除」面板，0 隐藏\nSSID Setting 中 suspend=true 的网络始终不自动加白，优先级最高\n\n【节点过滤】\nnode_names：节点完整名称，多个用 | 分隔\nnode_keywords：节点名称关键词，多个用 | 分隔\n上次检查以来走过命中的节点才自动加白；两项都不填则不过滤\n\n【手动加白】\n「po0 手动加白」不看节点、SSID Setting 和排除名单；已在白名单时不重复添加
 #!requirement=CORE_VERSION>=6009000
 
 [Rule]
