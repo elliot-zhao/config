@@ -2,7 +2,7 @@
 #!desc=自动读取当前配置的 SSID Setting 挂起条件；状态查询与加白分成两个面板。分钟优先，分钟为 0 时使用小时；开关为 0 时关闭定时兜底。
 #!category=po0
 #!arguments=tokens:"",fallback_enabled:1,fallback_minutes:30,fallback_hours:0
-#!arguments-desc=fallback_enabled：1 开启定时兜底，0 禁用全部定时任务（时间设置不生效）。tokens：原 pgnfw_ token，多个用英文逗号分隔，可选 @0 至 @4。fallback_minutes：0–59 的整数，默认 30；大于 0 时优先使用。fallback_hours：0–23 的整数，默认 0；仅分钟为 0 时生效。两者均为 0 关闭。1小时填分钟0/小时1，2小时填分钟0/小时2。原生 cron 按时钟步进，不增加轮询；不能整除60的分钟值/不能整除24的小时值，跨小时/跨天的末段间隔会缩短。
+#!arguments-desc=\n fallback_enabled：1 开启定时兜底，0 禁用全部定时任务（时间设置不生效）。\n tokens：pgnfw_ token，多个用英文逗号分隔，可选 @0 至 @4。\n fallback_minutes：0–59 的整数，默认 30；大于 0 时优先使用。\n fallback_hours：0–23 的整数，默认 0；仅分钟为 0 时生效。两者均为 0 关闭。1小时填分钟0/小时1，2小时填分钟0/小时2。原生 cron 按时钟步进，不增加轮询；不能整除60的分钟值/不能整除24的小时值，跨小时/跨天的末段间隔会缩短。
 #!requirement=CORE_VERSION>=6009000
 
 [Rule]
