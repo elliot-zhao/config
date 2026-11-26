@@ -1,23 +1,23 @@
 #!name=po0 防火墙（查询与加白）
-#!desc=自动读取当前配置的 SSID Setting 挂起条件；状态查询与加白分成两个面板。原生 cron 按指定时刻执行；fallback_enabled=0 关闭兜底。
+#!desc=自动读取当前配置的 SSID Setting 挂起条件；状态查询与加白分成两个面板。分钟优先，分钟为 0 时使用小时；开关为 0 时关闭定时兜底。
 #!category=po0
-#!arguments=tokens:"",fallback_enabled:1,fallback_cron:"*/30 * * * *"
-#!arguments-desc=tokens：原 pgnfw_ token，多个用英文逗号分隔，可选 @0 至 @4。fallback_enabled：1 开启定时兜底，0 关闭。fallback_cron：填写 cron 表达式，默认 */30 * * * *；每6分钟填 */6 * * * *，每2小时填 0 */2 * * *。参数值无需外层引号。Wi-Fi 挂起条件自动读取。
+#!arguments=tokens:"",fallback_enabled:1,fallback_minutes:30,fallback_hours:0
+#!arguments-desc=fallback_enabled：1 开启定时兜底，0 禁用全部定时任务（时间设置不生效）。tokens：原 pgnfw_ token，多个用英文逗号分隔，可选 @0 至 @4。fallback_minutes：0–59 的整数，默认 30；大于 0 时优先使用。fallback_hours：0–23 的整数，默认 0；仅分钟为 0 时生效。两者均为 0 关闭。1小时填分钟0/小时1，2小时填分钟0/小时2。原生 cron 按时钟步进，不增加轮询；不能整除60的分钟值/不能整除24的小时值，跨小时/跨天的末段间隔会缩短。
 #!requirement=CORE_VERSION>=6009000
 
 [Rule]
 IP-CIDR,124.221.69.228/32,DIRECT,no-resolve
 
 [Script]
-po0-firewall-network = type=event,event-name=network-changed,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&action=auto"
-po0-firewall-start = type=event,event-name=engine-started,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&action=auto"
-po0-firewall-status = type=generic,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&action=status"
-po0-firewall-add = type=generic,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&action=add"
-# 由 Surge 原生 cron 直接调度；没有每分钟检查时间的额外任务。
-# fallback_enabled=0：此 cron 禁用；=1：按 fallback_cron 指定的时刻执行。
-# 即使关闭，也保留合法的 fallback_cron 表达式，不要将表达式本身填成 0。
-#!REQUIREMENT {{{fallback_enabled}}}=1 po0-firewall-timer = type=cron,cronexp="{{{fallback_cron}}}",wake-system=false,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&action=auto"
+po0-firewall-network = type=event,event-name=network-changed,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&fallback_minutes={{{fallback_minutes}}}&fallback_hours={{{fallback_hours}}}&action=auto"
+po0-firewall-start = type=event,event-name=engine-started,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&fallback_minutes={{{fallback_minutes}}}&fallback_hours={{{fallback_hours}}}&action=auto"
+po0-firewall-status = type=generic,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&fallback_minutes={{{fallback_minutes}}}&fallback_hours={{{fallback_hours}}}&action=status"
+po0-firewall-add = type=generic,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&fallback_minutes={{{fallback_minutes}}}&fallback_hours={{{fallback_hours}}}&action=add"
+# 开关为 0 时两条规则均禁用；开启后分钟优先，分钟为 0 才启用小时；两者为 0 时均禁用。
+# REQUIREMENT 条件为假时，该行不启动定时任务；没有额外的每分钟检查。
+#!REQUIREMENT "{{{fallback_enabled}}}=1 AND {{{fallback_minutes}}}>0 AND {{{fallback_minutes}}}<60" po0-firewall-timer-minutes = type=cron,cronexp="*/{{{fallback_minutes}}} * * * *",wake-system=false,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&fallback_minutes={{{fallback_minutes}}}&fallback_hours={{{fallback_hours}}}&timer_unit=minutes&action=auto"
+#!REQUIREMENT "{{{fallback_enabled}}}=1 AND {{{fallback_minutes}}}=0 AND {{{fallback_hours}}}>0 AND {{{fallback_hours}}}<24" po0-firewall-timer-hours = type=cron,cronexp="0 */{{{fallback_hours}}} * * *",wake-system=false,script-path=https://raw.githubusercontent.com/elliot-zhao/config/refs/heads/main/po0-firewall.js,timeout=60,argument="tokens={{{tokens}}}&fallback_enabled={{{fallback_enabled}}}&fallback_minutes={{{fallback_minutes}}}&fallback_hours={{{fallback_hours}}}&timer_unit=hours&action=auto"
 
 [Panel]
-po0-firewall-status = script-name=po0-firewall-status,title=po0 · 查询状态（只读）,content=点击刷新查询白名单与槽位，不执行加白,update-interval=1
-po0-firewall-add = script-name=po0-firewall-add,title=po0 · 立即加白,content=点击本面板刷新按钮才执行加白,update-interval=1
+po0-firewall-status = script-name=po0-firewall-status,title=po0 状态 · 只读,content=点击刷新查询状态与槽位，不加白,icon=checkmark.shield,icon-color=#007AFF,update-interval=1
+po0-firewall-add = script-name=po0-firewall-add,title=po0 手动加白,content=点击刷新执行加白,icon=checkmark.shield,icon-color=#007AFF,update-interval=1
