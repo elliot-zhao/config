@@ -68,8 +68,16 @@
   }
   function redact(s) { return String(s).replace(/pgnfw_[A-Za-z0-9_-]+/g, "[token]"); }
   function notice(value) {
-    try { $notification.post("po0 防火墙", value.title, redact(value.content)); } catch (_) {}
+    // 通知只带结果正文，不带面板底部的时间记录
+    try { $notification.post("po0 防火墙", value.title, redact(value.body || value.content)); } catch (_) {}
   }
+  // 加白失败提醒：同样的失败原因只提醒一次；加白成功后清除，之后再失败会重新提醒。
+  function failNotice(signature, body) {
+    if (read(key + "_error") === signature) return;
+    write(key + "_error", signature);
+    try { $notification.post("po0 防火墙", "❌ 加白失败", redact(body)); } catch (_) {}
+  }
+  function clearFailNotice() { write(key + "_error", null); }
   function wait(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
   function connected() { return !!((network.v4 || {}).primaryAddress || (network.v6 || {}).primaryAddress); }
   function networkLabel() {
@@ -173,8 +181,10 @@
   function cached() {
     var readonly = action !== "add", saved = read(key + (readonly ? "_snapshot" : "_add"));
     if (saved && saved.layout === 2) return decorate(saved, readonly);
+    var lines = timeline();
     return card(readonly ? "po0 状态 · 只读" : "po0 手动加白",
       (saved ? "已有旧记录，请刷新更新显示。" : "暂无记录") + "\n" +
+      (lines.length ? lines.join("\n") + "\n" : "") +
       (readonly ? "点刷新查询 · 不加白" : "点刷新执行加白") + "\n" + scheduleLabel());
   }
   function stamp(at) {
@@ -182,8 +192,39 @@
     function two(n) { return (n < 10 ? "0" : "") + n; }
     return two(d.getMonth() + 1) + "/" + two(d.getDate()) + " " + two(d.getHours()) + ":" + two(d.getMinutes());
   }
+  // 三类事件各自保存，互不覆盖：最近加白、最近失败、最近检查（以及最近一次成功，用来判断失败之后是否已恢复）。
+  function recordEvent(kind, data) {
+    var events = read(key + "_events");
+    if (!events || typeof events !== "object") events = {};
+    events[kind] = data;
+    write(key + "_events", events);
+  }
+  function shortText(s, n) {
+    s = String(s || "").replace(/^#\d+\s*/, "").replace(/[；;。]+$/, "");
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
+  function timeline() {
+    var ev = read(key + "_events"), lines = [];
+    if (!ev || typeof ev !== "object") return lines;
+    if (ev.added) lines.push("最近加白 " + stamp(ev.added.at) + " · " + ev.added.via + (ev.added.ip ? " · " + ev.added.ip : ""));
+    if (ev.failed) {
+      lines.push("最近失败 " + stamp(ev.failed.at) + " · " + ev.failed.via + " · " + shortText(ev.failed.reason, 36) +
+        (ev.ok && ev.ok.at > ev.failed.at ? "（之后已恢复）" : ""));
+    }
+    if (ev.checked) lines.push("最近检查 " + stamp(ev.checked.at) + " · " + ev.checked.via + " · " + shortText(ev.checked.text, 30));
+    return lines;
+  }
+  // 触发方式：定时 / 启动 / 换网络 / 手动
+  function viaLabel() {
+    if (scriptType === "cron") return "定时";
+    if (eventName === "engine-started") return "启动";
+    if (eventName === "network-changed") return "换网络";
+    return "手动";
+  }
   function decorate(record, readonly) {
-    record.content = record.body + "\n\n记录 " + stamp(record.recordedAt) + " · " + record.source + "\n" +
+    var lines = timeline();
+    record.content = record.body + "\n\n" + (lines.length ? lines.join("\n") + "\n" : "") +
+      "记录 " + stamp(record.recordedAt) + " · " + record.source + "\n" +
       (readonly ? "点刷新仅查询" : "点刷新加白") + " · " + scheduleLabel();
     return record;
   }
@@ -659,7 +700,9 @@
       if (!force) {
         if (supportedEvent) await wait(2000);
         if (!current()) { done(); return; }
-        var reason = networkExclusion() || await suspension();
+        var exReason = networkExclusion();
+        var suspendReason = exReason ? "" : await suspension();
+        var reason = exReason || suspendReason;
         // 挂起/排除先行；节点检查放在配置读取之后，缩短判断与 POST 之间的时间。
         if (!reason) {
           reason = await nodeRestriction();
@@ -675,6 +718,8 @@
         if (!current()) { done(); return; }
         if (reason) {
           if (nodeChecked) markChecked();
+          var skipKind = exReason ? "网络已排除" : suspendReason ? "SSID Setting 挂起" : reason === DIRECT_MODE ? "全局直连" : "没在用 po0";
+          recordEvent("checked", { at: Date.now(), via: viaLabel(), text: "跳过：" + skipKind });
           var skipped = messageCard("po0 加白 · 已跳过", networkLabel() + "\n" + reason, "info", false, "条件检查");
           write(key + "_add", skipped); done(decorate(skipped, false)); return;
         }
@@ -686,21 +731,48 @@
     // 自动加白成功后才推进「上次检查」时间；失败时保留，下次检查还会算上这段时间的请求。
     if (nodeChecked && !failed) markChecked();
     var source = readonly ? "只读查询" : isCron ? "定时加白" : supportedEvent ? eventName === "engine-started" ? "启动加白" : "网络加白" : "手动加白";
+    var added = !readonly && results.some(function (r) { return !r.error && !r.already && r.applied; });
+    var reasons = [];
+    results.forEach(function (r, i) {
+      if (r.error || !r.ok) reasons.push("#" + (i + 1) + " " + (r.error || "目标槽位未生效"));
+    });
+    // 先记下事件时间，面板这次显示的内容才会包含本次结果。
+    if (!readonly) {
+      var at = Date.now(), via = viaLabel();
+      if (added) {
+        var newIp = (results.filter(function (r) { return !r.error && !r.already && r.applied; })[0] || {}).ip;
+        recordEvent("added", { at: at, via: via, ip: newIp && newIp !== "未知" ? newIp : "" });
+      }
+      if (failed) recordEvent("failed", { at: at, via: via, reason: reasons[0] });
+      else recordEvent("ok", { at: at });
+      recordEvent("checked", { at: at, via: via, text: added ? "已加白" : failed ? "失败" : "已在白名单" });
+    }
     var result = resultCard(results, entries, readonly, source);
-    var previous = read(key + "_snapshot");
     if (results.some(function (r) { return !r.error; })) write(key + "_snapshot", readonly ? result : resultCard(results, entries, true, source));
     if (!readonly) {
       write(key + "_add", result);
-      if (manual || failed || !previous || previous.signature !== result.signature) notice(result);
+      // 通知：真的新加进白名单时通知；加白失败时提醒（同样的失败只提醒一次）；已在白名单、跳过都不通知。
+      if (added) notice(result);
+      if (failed) failNotice(reasons.join("\n"), networkLabel() + "\n" + reasons.join("\n"));
+      else clearFailNotice();
     }
     done(result);
   }
   main().catch(function (error) {
+    var message = redact(error && error.message || "脚本异常");
+    var isAdd = action === "auto" || action === "add";
+    // 「等待下一次触发」是检查途中网络刚好变化，属于正常情况：不算失败，也不提醒。
+    var benign = message.indexOf("等待下一次触发") >= 0;
+    if (isAdd && current()) {
+      var at = Date.now();
+      if (!benign) recordEvent("failed", { at: at, via: viaLabel(), reason: message });
+      recordEvent("checked", { at: at, via: viaLabel(), text: benign ? "网络刚变化，等下次检查" : "出错" });
+    }
     var result = messageCard("po0 " + (action.indexOf("network_") === 0 ? "网络排除" : action === "status" ? "查询" : "加白") + " · 未完成",
-      redact(error && error.message || "脚本异常"), "error", action === "status", "执行失败");
+      message, "error", action === "status", "执行失败");
     if (attemptedWrite && current()) write(key + "_add", result);
-    // 自动错误只在变化时通知，避免同一配置问题反复打扰。
-    if (!panel && current() && read(key + "_error") !== result.content) { notice(result); write(key + "_error", result.content); }
+    // 加白过程出错也提醒（同样的错误只提醒一次）；只读查询、排除面板出错不提醒。
+    if (isAdd && current() && !benign) failNotice(message, networkLabel() + "\n" + message);
     done(result);
   });
 })();
