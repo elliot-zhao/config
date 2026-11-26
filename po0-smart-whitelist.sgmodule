@@ -1,5 +1,5 @@
 #!name=po0 防火墙（按节点自动加白）
-#!desc=只在连接 nodes 参数里的节点时自动加白，先查询再添加，避免挤掉 FIFO 名额。三个面板：状态查询（只读）、手动加白、排除当前网络。自动读取 SSID Setting 的挂起条件，也可用 exclude 参数排除网络。定时兜底：分钟优先，分钟为 0 时使用小时；开关为 0 时关闭定时兜底。
+#!desc=只在连接 nodes 参数里的节点时自动加白，先查询再添加，避免挤掉 FIFO 名额。检查时机：网络变化、Surge 启动、打开策略页（面板自动刷新时）、定时兜底。三个面板：状态查询（只读）、手动加白、排除当前网络。自动读取 SSID Setting 的挂起条件，也可用 exclude 参数排除网络。定时兜底：分钟优先，分钟为 0 时使用小时；开关为 0 时关闭定时兜底。
 #!category=po0
 #!requirement=CORE_VERSION>=6009000
 #!arguments=tokens:"",nodes:"",exclude:"",fallback_enabled:1,fallback_minutes:30,fallback_hours:0,active_window:15,latency_test:0
