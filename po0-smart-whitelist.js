@@ -20,7 +20,7 @@
     argumentsText = argumentsText.slice(0, ssidArgument);
   }
   // 从后往前拆原文参数（策略组名、节点名里可能有 & 等字符）；兼容旧模块传入的 policy_group，但不再用它筛选节点。
-  ["select_groups", "node_keywords", "node_names", "policy_group"].forEach(function (name) {
+  ["groups", "node_keywords", "node_names", "policy_group"].forEach(function (name) {
     var marker = "&" + name + "=", at = argumentsText.indexOf(marker);
     if (at >= 0) { params[name] = argumentsText.slice(at + marker.length); argumentsText = argumentsText.slice(0, at); }
   });
@@ -341,16 +341,38 @@
     function show(list, suffix) {
       selectedNode = list.slice(0, 3).join("、") + (list.length > 3 ? " 等 " + list.length + " 个" : "") + suffix;
     }
-    // 1) select_groups 指定的手动选择组当前选中的节点：顺着嵌套的 select 组往下找，只认节点，不认策略组名。
+    // 1) groups 指定的策略组当前在用的节点（手动选择组是你选的节点；fallback 组是它自己选的，或你覆盖的节点）。
+    //    用 /v1/policy_groups/select 读取；返回的若是另一个策略组就继续往下读，直到具体节点。
+    //    某个组读不到时只跳过它，不影响下面的请求记录判断。
+    async function currentPolicyOf(group) {
+      var seen = {}, cur = group;
+      for (var depth = 0; depth < 8; depth++) {
+        if (seen[cur]) return null;
+        seen[cur] = true;
+        var r;
+        try { r = await localAPI("/v1/policy_groups/select", { group_name: cur }, "策略组当前选择"); } catch (_) { return null; }
+        var p = r && typeof r.policy === "string" ? r.policy : "";
+        if (!p) return null;
+        if (groups.indexOf(p) >= 0) { cur = p; continue; }
+        return p;
+      }
+      return null;
+    }
+    var words = groupWords();
+    var starts = words.length ? groups.filter(function (g) {
+      var lower = g.toLowerCase();
+      return words.some(function (w) { return lower.indexOf(w) >= 0; });
+    }).slice(0, 10) : [];
+    var currents = await Promise.all(starts.map(currentPolicyOf));
     var picked = [], pickedGroups = [];
-    selectedChains().forEach(function (entry) {
-      var name = nodeName(entry.name);
+    currents.forEach(function (policy, i) {
+      var name = policy ? nodeName(policy) : null;
       if (!name || !hits(name)) return;
       if (picked.indexOf(name) < 0) picked.push(name);
-      if (pickedGroups.indexOf(entry.group) < 0) pickedGroups.push(entry.group);
+      if (pickedGroups.indexOf(starts[i]) < 0) pickedGroups.push(starts[i]);
     });
     checkedAt = Date.now();
-    if (picked.length) { show(picked, "（" + pickedGroups.slice(0, 2).join("、") + " 选中）"); return ""; }
+    if (picked.length) { show(picked, "（" + pickedGroups.slice(0, 2).join("、") + " 当前在用）"); return ""; }
     // 2) 上次检查以来、当前网络上的请求记录。
     var active = requestRows(await localAPI("/v1/requests/active", {}, "活动请求"), "活动请求");
     var recent = requestRows(await localAPI("/v1/requests/recent", {}, "近期请求"), "近期请求");
@@ -367,7 +389,7 @@
       });
     }
     collect(active, true); collect(recent, false);
-    if (!candidates.length) return "上次检查以来没有代理请求，手动选择组也没有选中指定节点；未加白。";
+    if (!candidates.length) return "上次检查以来没有代理请求，groups 里的组当前也没在用指定节点；未加白。";
     var matched = [], unresolved = false;
     candidates.forEach(function (candidate) {
       var name = nodeName(candidate);
@@ -375,40 +397,15 @@
       if (hits(name) && matched.indexOf(name) < 0) matched.push(name);
     });
     if (!matched.length) {
-      return unresolved ? "请求尚未提供可确认的最终节点，或已知节点未匹配；手动选择组也没有选中指定节点；未加白。" :
-        "实际请求的节点未匹配指定名称或关键词，手动选择组也没有选中；未加白。";
+      return unresolved ? "请求尚未提供可确认的最终节点，或已知节点未匹配；groups 里的组当前也没在用指定节点；未加白。" :
+        "实际请求的节点未匹配指定名称或关键词，groups 里的组当前也没在用；未加白。";
     }
     show(matched, "");
     return "";
   }
-  // select_groups：组名里包含的文字，多个用 | 分隔，不分大小写；不填则不做「选中」判断。
-  function selectGroupWords() {
-    return String(params.select_groups || "").split("|").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
-  }
-  // 名称匹配 select_groups 的手动选择组当前选中的策略，含嵌套 select 组一路往下的每一层。
-  // 返回 [{ group: 起点组名, name: 选中的策略名 }]；没填参数或读不到时返回空列表。
-  function selectedChains() {
-    var words = selectGroupWords();
-    if (!words.length) return [];
-    var details = null;
-    try {
-      if (typeof $surge !== "undefined" && $surge && typeof $surge.selectGroupDetails === "function") details = $surge.selectGroupDetails();
-    } catch (_) {}
-    var decisions = details && details.decisions;
-    if (!decisions || typeof decisions !== "object") return [];
-    var out = [];
-    Object.keys(decisions).forEach(function (group) {
-      var lower = group.toLowerCase();
-      if (!words.some(function (w) { return lower.indexOf(w) >= 0; })) return;
-      var seen = {}, cur = decisions[group], depth = 0;
-      while (typeof cur === "string" && cur && !seen[cur] && depth < 16) {
-        seen[cur] = true;
-        out.push({ group: group, name: cur });
-        cur = decisions[cur];
-        depth++;
-      }
-    });
-    return out;
+  // groups：要看「当前在用节点」的策略组，填组名里包含的文字，多个用 | 分隔，不分大小写；不填则不做这项判断。
+  function groupWords() {
+    return String(params.groups || "").split("|").map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
   }
   // 注释分隔符只在引号外、且行首或前有空格时生效。
   function withoutComment(line) {
