@@ -6,7 +6,8 @@
  *   po0 手动加白         action=add      点击刷新 → 立即加白（不看节点，但遵守排除）
  *   po0 排除当前网络     action=exclude  点击刷新 → 把当前 Wi-Fi / 蜂窝加入或移出排除列表
  *
- * 自动加白（action=auto）：网络变化、Surge 启动、原版的分钟/小时定时器触发时检查，
+ * 自动加白：网络变化、Surge 启动、原版的分钟/小时定时器，以及打开策略页（iOS 面板自动刷新时，
+ *   由「po0 排除当前网络」面板顺带检查）都会检查一次，
  *   只有 nodes 参数里的节点在 active_window 分钟内「有连接请求」才会加白；
  *   latency_test=1 时，节点延迟测试结果有变化也算。
  *   先 GET 查询，当前 /24 已在白名单就不再 POST（po0 白名单是 FIFO，多余的 add 会挤掉别的设备）。
@@ -26,7 +27,11 @@ const K = {
   gen: 'po0wl_gen', // 网络事件去抖
   err: 'po0wl_last_err', // 自动加白的上一次错误（避免重复通知）
   bench: 'po0wl_bench', // 节点延迟测试结果快照
+  auto: 'po0wl_auto', // 最近一次自动检查的摘要（不会被查询覆盖）
+  ok: 'po0wl_ok', // 各 token 在哪个网络下确认过已加白
 };
+const PANEL_THROTTLE_MS = 20 * 1000; // 打开策略页触发的检查，最短间隔
+const PANEL_CACHE_MS = 10 * 60 * 1000; // 打开策略页触发时，同一网络 10 分钟内确认过就不再请求服务器
 const NOTIFY_TITLE = 'po0 防火墙';
 const COLOR = { good: '#34C759', info: '#007AFF', alert: '#FF9500', error: '#FF3B30', idle: '#8E8E93' };
 const MIN_CORE = 6009000; // 与模块 #!requirement 一致
@@ -576,8 +581,8 @@ async function detectNodes() {
           if (p) names.push(p);
         });
       });
-      const t = ts || now();
-      names.forEach((n) => { if (!used[n] || used[n] < t) used[n] = t; });
+      const t = ts || 0; // 0 = 时间未知（仍算在用，但面板显示「最近」而不是「刚刚」）
+      names.forEach((n) => { if (!(n in used) || used[n] < t) used[n] = t; });
     });
     det.traffic = Object.keys(used).map((n) => ({ name: n, ts: used[n] }));
   }
@@ -770,47 +775,86 @@ function firstNode(tokens) {
 
 /* ============================== 三种动作 ============================== */
 
-// 自动：网络变化 / 启动 / 定时
-async function runAuto(reason) {
+// 一次自动检查的结果，写进状态面板缓存，并单独留一份摘要（不会被「查询」覆盖）
+function autoSummary(snap) {
+  if (snap.note) return snap.note.replace(/^⚠️\s*/, '');
+  if (snap.excluded) return '本网络已排除，未加白';
+  const t = snap.tokens;
+  const ip = ipOf(snap);
+  const err = t.find((x) => x.status === 'error');
+  if (err) return '加白失败：' + err.msg;
+  if (t.some((x) => x.status === 'added')) return '已自动加白 ' + ip;
+  if (t.some((x) => x.status === 'ok' || x.status === 'cached')) return '已在白名单' + (ip ? ' ' + ip : '');
+  if (t.some((x) => x.status === 'disabled')) return '防火墙未开启';
+  if (t.length && t.every((x) => x.status === 'idle')) return '没有节点连接，未加白';
+  return '完成';
+}
+function finishAuto(snap) {
+  writeJSON(K.auto, { at: snap.at, reason: snap.reason, text: autoSummary(snap) });
+  return saveSnap(K.snap, snap);
+}
+function rememberOk(snap, net) {
+  const ok = readJSON(K.ok, {});
+  snap.tokens.forEach((t) => {
+    if (t.status === 'ok' || t.status === 'added') ok[t.id] = { fp: net.fp, at: now() };
+    else if (t.status === 'notin' || t.status === 'error') delete ok[t.id];
+  });
+  writeJSON(K.ok, ok);
+}
+
+// 自动：网络变化 / 启动 / 定时 / 打开策略页
+// opt.panel = true 表示由面板自动刷新触发：有节流，并且同一网络 10 分钟内确认过的 token 不再请求服务器
+async function runAuto(reason, opt) {
+  opt = opt || {};
+  const last = readJSON(K.auto, null);
+  if (opt.panel && last && now() - last.at < PANEL_THROTTLE_MS) return null;
+
   const net = getNet();
   const snap = newSnap(net, '自动检查 · ' + reason);
+  snap.reason = reason;
   if (!CFG.tokens.valid.length) {
     snap.note = CFG.tokens.invalid.length ? '⚠️ token 格式不对：' + CFG.tokens.invalid[0].slice(0, 24) : '⚠️ 还没填写 tokens';
-    return saveSnap(K.snap, snap);
+    return finishAuto(snap);
   }
-  if (net.type === 'NONE') { snap.note = '无网络，跳过'; return saveSnap(K.snap, snap); }
+  if (net.type === 'NONE') { snap.note = '无网络，跳过'; return finishAuto(snap); }
 
   const ex = await exclusionOf(net);
   if (isExcluded(ex)) {
     snap.excluded = exclusionText(ex);
     snap.tokens = CFG.tokens.valid.map((t) => ({ id: t.id, tag: t.tag, status: 'excluded' }));
     log('当前网络不加白：', net.label, snap.excluded);
-    return saveSnap(K.snap, snap);
+    return finishAuto(snap);
   }
   if (!ex.profileOk) {
     snap.note = '⚠️ 读不到配置里的 SSID Setting，本次不自动加白';
-    return saveSnap(K.snap, snap);
+    return finishAuto(snap);
   }
   if (!CFG.nodes && !CFG.tokens.valid.some((t) => t.match)) {
     snap.note = '⚠️ 还没填写 nodes（节点关键词），自动加白未启用';
-    return saveSnap(K.snap, snap);
+    return finishAuto(snap);
   }
 
   const det = await detectNodes();
+  const okCache = readJSON(K.ok, {});
   snap.tokens = await Promise.all(
     CFG.tokens.valid.map(async (tok) => {
       const m = tok.match || CFG.nodes;
       if (!m) return { id: tok.id, tag: tok.tag, status: 'nokw' };
       const hit = hitFor(m, det);
       if (!hit) return { id: tok.id, tag: tok.tag, status: 'idle', kw: m.text };
+      const c = okCache[tok.id];
+      if (opt.panel && c && c.fp === net.fp && now() - c.at < PANEL_CACHE_MS) {
+        return { id: tok.id, tag: tok.tag, status: 'cached', okAt: c.at, node: hit };
+      }
       const r = await ensureToken(tok);
       return Object.assign(r, { id: tok.id, tag: tok.tag, node: hit });
     })
   );
   snap.node = firstNode(snap.tokens);
   snap.tokens.forEach((t) => log(t.tag, t.status, t.msg || '', t.ip || '', t.node ? t.node.name : ''));
+  rememberOk(snap, net);
   notifyAuto(snap);
-  return saveSnap(K.snap, snap);
+  return finishAuto(snap);
 }
 
 // 「po0 状态 · 只读」：只查询，不加白
@@ -834,6 +878,7 @@ async function runStatus() {
     })
   );
   snap.node = firstNode(snap.tokens);
+  rememberOk(snap, net);
   return saveSnap(K.snap, snap);
 }
 
@@ -854,6 +899,7 @@ async function runManualAdd() {
     snap.tokens = await Promise.all(
       CFG.tokens.valid.map(async (tok) => Object.assign(await ensureToken(tok), { id: tok.id, tag: tok.tag }))
     );
+    rememberOk(snap, net);
   }
   writeJSON(K.add, snap);
   saveSnap(K.snap, JSON.parse(JSON.stringify(snap)));
@@ -907,6 +953,7 @@ function statusText(t) {
   switch (t.status) {
     case 'ok': return '✅ 已在白名单' + cnt;
     case 'added': return '➕ 已加入白名单' + cnt;
+    case 'cached': return '✅ 已在白名单（' + ago(t.okAt) + '确认）';
     case 'notin': return '⚠️ 当前 IP 不在白名单' + cnt;
     case 'disabled': return '⚪ 防火墙未开启';
     case 'error': return '❌ ' + t.msg;
@@ -932,9 +979,10 @@ function entriesLine(t) {
   return '   ' + list.join(' · ') + (t.entries.length > 5 ? ' …' : '');
 }
 
-function renderSnap(snap, title, hint, withEntries) {
+function renderSnap(snap, title, hint, withEntries, extra) {
+  extra = (extra || []).filter(Boolean);
   if (!snap) {
-    return { title: title, content: hint, icon: 'checkmark.shield', 'icon-color': COLOR.info };
+    return { title: title, content: extra.concat([hint]).join('\n'), icon: 'checkmark.shield', 'icon-color': COLOR.info };
   }
   const ip = ipOf(snap);
   const L = [snap.net.label + (ip ? ' · ' + ip : '')];
@@ -949,21 +997,61 @@ function renderSnap(snap, title, hint, withEntries) {
     snap.tokens.forEach((t) => {
       L.push(t.tag + '  ' + statusText(t));
       if (withEntries) { const e = entriesLine(t); if (e) L.push(e); }
+      if (t.status === 'notin' && t.node && t.node.via !== 'unknown' && !snap.excluded) {
+        L.push('   ↳ 已连接但不在白名单，下次自动检查会加白');
+      }
     });
     const s = snap.tokens.map((t) => t.status);
     if (s.indexOf('error') >= 0) { tone = 'error'; icon = 'exclamationmark.shield'; }
     else if (s.indexOf('notin') >= 0) { tone = 'alert'; icon = 'exclamationmark.shield'; }
-    else if (s.some((x) => x === 'ok' || x === 'added')) { tone = 'good'; icon = 'checkmark.shield'; }
+    else if (s.some((x) => x === 'ok' || x === 'added' || x === 'cached')) { tone = 'good'; icon = 'checkmark.shield'; }
     else if (s.every((x) => x === 'idle')) { tone = 'idle'; icon = 'shield'; }
   } else if (snap.note && snap.note.indexOf('⚠️') === 0) {
     tone = 'alert';
     icon = 'exclamationmark.shield';
   }
+  extra.forEach((x) => L.push(x));
   L.push(hhmm(snap.at) + ' ' + snap.source + ' · ' + hint);
   return { title: title, content: L.join('\n'), icon: icon, 'icon-color': COLOR[tone] };
 }
 
+// 下一次定时器触发的时间（与 cron 表达式一致：*/N 分钟，或 0 */N 小时）
+function nextTimerAt() {
+  const plan = timerPlan();
+  if (plan === 'off') return 0;
+  const base = new Date();
+  base.setSeconds(0, 0);
+  if (plan === 'minutes') {
+    for (let i = 1; i <= 61; i++) {
+      const t = new Date(base.getTime() + i * 60000);
+      if (t.getMinutes() % CFG.fbMinutes === 0) return t.getTime();
+    }
+  } else {
+    base.setMinutes(0);
+    for (let i = 1; i <= 25; i++) {
+      const t = new Date(base.getTime() + i * 3600000);
+      if (t.getHours() % CFG.fbHours === 0) return t.getTime();
+    }
+  }
+  return 0;
+}
+
+// 状态面板额外显示：上次自动检查做了什么、下次什么时候检查
+function autoLines(snap) {
+  const L = [];
+  const a = readJSON(K.auto, null);
+  if (a && !(snap && /^自动检查/.test(snap.source || '') && snap.at === a.at)) {
+    L.push('自动：' + hhmm(a.at) + ' ' + a.reason + ' → ' + a.text);
+  }
+  const next = nextTimerAt();
+  L.push((next ? '下次定时 ' + hhmm(next) : '定时已关闭') + ' · 打开策略页时也会检查');
+  return L;
+}
+
 async function renderExcludePanel(tapped) {
+  // 面板自动刷新（iOS 切到策略页时）顺带做一次自动检查：
+  // 在同一网络里中途连上节点，不用等定时器
+  if (!tapped) await runAuto('打开策略页', { panel: true });
   const net = getNet();
   let dyn = readJSON(K.excluded, []);
   let msg = '';
@@ -998,6 +1086,8 @@ async function renderExcludePanel(tapped) {
   const L = [net.label];
   L.push(excluded ? '🚫 不自动加白 · ' + exclusionText(ex) : '✅ 连接 po0 节点时会自动加白');
   if (msg) L.push(msg);
+  const a = readJSON(K.auto, null);
+  if (a && !tapped) L.push('自动检查 ' + hhmm(a.at) + '：' + a.text);
   if (dyn.length) {
     const names = dyn.map((e) => e.label || e.expr);
     L.push('面板已排除：' + names.slice(0, 4).join('、') + (names.length > 4 ? ' 等 ' + names.length + ' 个' : ''));
@@ -1024,8 +1114,10 @@ const REASON = { network: '网络变化', start: 'Surge 启动', minutes: '定�
 
 async function main() {
   switch (CFG.action) {
-    case 'status':
-      return renderSnap(TAPPED ? await runStatus() : readJSON(K.snap, null), 'po0 状态 · 只读', '点击刷新查询状态与槽位，不加白', true);
+    case 'status': {
+      const snap = TAPPED ? await runStatus() : readJSON(K.snap, null);
+      return renderSnap(snap, 'po0 状态 · 只读', '点击刷新查询状态与槽位，不加白', true, autoLines(snap));
+    }
 
     case 'add':
       return renderSnap(TAPPED ? await runManualAdd() : readJSON(K.add, null), 'po0 手动加白', '点击刷新执行加白', false);
